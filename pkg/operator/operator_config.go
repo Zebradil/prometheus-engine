@@ -517,10 +517,8 @@ func (r *operatorConfigReconciler) makeAlertmanagerConfigs(ctx context.Context, 
 		}
 		// TLS config.
 		if am.TLS != nil {
-			tlsCfg := promcommonconfig.TLSConfig{
-				InsecureSkipVerify: am.TLS.InsecureSkipVerify,
-				ServerName:         am.TLS.ServerName,
-			}
+			tlsCfg := am.TLS.ToPrometheusConfig()
+
 			if am.TLS.CA != nil {
 				p := pathForSelector(r.opts.PublicNamespace, am.TLS.CA)
 				b, err := getSecretOrConfigMapBytes(ctx, r.client, r.opts.PublicNamespace, am.TLS.CA)
@@ -549,7 +547,7 @@ func (r *operatorConfigReconciler) makeAlertmanagerConfigs(ctx context.Context, 
 				tlsCfg.KeyFile = path.Join(secretsDir, p)
 			}
 
-			cfg.HTTPClientConfig.TLSConfig = tlsCfg
+			cfg.HTTPClientConfig.TLSConfig = *tlsCfg
 		}
 
 		// Configure discovery of AM endpoints via Kubernetes API.
@@ -633,7 +631,7 @@ func getSecretOrConfigMapBytes(ctx context.Context, kClient client.Reader, names
 	return b, nil
 }
 
-// getSecretKeyBytes processes the given NamespacedSecretKeySelector and returns the referenced data.
+// getSecretKeyBytes processes the given SecretKeySelector and returns the referenced data.
 func getSecretKeyBytes(ctx context.Context, kClient client.Reader, namespace string, sel *corev1.SecretKeySelector) ([]byte, error) {
 	var (
 		secret = &corev1.Secret{}

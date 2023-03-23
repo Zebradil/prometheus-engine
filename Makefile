@@ -17,7 +17,7 @@ TAG_NAME?=$(shell date "+gmp-%Y%d%m_%H%M")
 # TODO(pintohutch): this is a bit hacky, but can be useful when testing.
 # Ultimately this should be replaced with go templating.
 define update_manifests
-	find manifests examples cmd/operator/deploy -type f -name "*.yaml" -exec sed -i "s#image: .*/$(1):.*#image: ${IMAGE_REGISTRY}/$(1):${TAG_NAME}#g" {} \;
+	find manifests examples cmd/example-app cmd/operator/deploy -type f -name "*.yaml" -exec sed -i "s#image: .*/$(1):.*#image: ${IMAGE_REGISTRY}/$(1):${TAG_NAME}#g" {} \;
 endef
 
 define docker_build

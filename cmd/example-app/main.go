@@ -16,10 +16,18 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	cryptorand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/pem"
+	"errors"
 	"flag"
 	"io"
 	"log"
+	"math/big"
 	"math/rand"
 	"net/http"
 	_ "net/http/pprof"
@@ -34,32 +42,37 @@ import (
 )
 
 var (
-	addr             = flag.String("listen-address", ":8080", "The address to listen on for HTTP requests.")
-	cpuBurnOps       = flag.Int("cpu-burn-ops", 0, "Operatins per second burning CPU. (Used to simulate high CPU utilization. Sensible values: 0-100.)")
-	memBallastMBs    = flag.Int("memory-ballast-mbs", 0, "Megabytes of memory ballast to allocate. (Used to simulate high memory utilization.)")
-	maxCount         = flag.Int("max-count", labelCombinations, "Maximum metric instance count for all metric types.")
-	histogramCount   = flag.Int("histogram-count", 2, "Number of unique instances per histogram metric.")
-	gaugeCount       = flag.Int("gauge-count", -1, "Number of unique instances per gauge metric.")
-	counterCount     = flag.Int("counter-count", -1, "Number of unique instances per counter metric.")
-	summaryCount     = flag.Int("summary-count", -1, "Number of unique instances per summary metric.")
-	exemplarSampling = flag.Float64("exemplar-sampling", 0.1, "Fraction of observations to include exemplars on histograms.")
+	addr               = flag.String("listen-address", ":8080", "The address to listen on for HTTP requests.")
+	cpuBurnOps         = flag.Int("cpu-burn-ops", 0, "Operatins per second burning CPU. (Used to simulate high CPU utilization. Sensible values: 0-100.)")
+	memBallastMBs      = flag.Int("memory-ballast-mbs", 0, "Megabytes of memory ballast to allocate. (Used to simulate high memory utilization.)")
+	maxCount           = flag.Int("max-count", labelCombinations, "Maximum metric instance count for all metric types.")
+	histogramCount     = flag.Int("histogram-count", 2, "Number of unique instances per histogram metric.")
+	gaugeCount         = flag.Int("gauge-count", -1, "Number of unique instances per gauge metric.")
+	counterCount       = flag.Int("counter-count", -1, "Number of unique instances per counter metric.")
+	summaryCount       = flag.Int("summary-count", -1, "Number of unique instances per summary metric.")
+	exemplarSampling   = flag.Float64("exemplar-sampling", 0.1, "Fraction of observations to include exemplars on histograms.")
+	tlsCert            = flag.String("tls-cert", "", "Path to the server TLS certificate")
+	tlsKey             = flag.String("tls-key", "", "Path to the server TLS key")
+	selfSigned         = flag.Bool("self-signed", false, "Path to the server TLS key")
+	serverName         = flag.String("server-name", "Example", "Name of the server, used to verify the TLS certificate")
+	insecureSkipVerify = flag.Bool("insecure-skip-verify", false, "Whether to skip verifying the certificate")
 )
 
 var (
 	availableLabels = map[string][]string{
-		"method": []string{
+		"method": {
 			"POST",
 			"PUT",
 			"GET",
 		},
-		"status": []string{
+		"status": {
 			"200",
 			"300",
 			"400",
 			"404",
 			"500",
 		},
-		"path": []string{
+		"path": {
 			"/",
 			"/index",
 			"/topics",
@@ -142,8 +155,29 @@ var (
 	)
 )
 
+func validateFlags() error {
+	errList := []error{}
+	if flag.Lookup("self-signed") != nil {
+		if *tlsCert != "" {
+			errList = append(errList, errors.New("self-signed and tls-cert cannot be used together"))
+		}
+		if *tlsKey != "" {
+			errList = append(errList, errors.New("self-signed and tls-key cannot be used together"))
+		}
+	}
+	if (*tlsCert != "" || *tlsKey != "") && (*tlsCert == "" || *tlsKey == "") {
+		errList = append(errList, errors.New("tls-cert and tls-key must both be set"))
+	}
+	return errors.Join(errList...)
+}
+
 func main() {
 	flag.Parse()
+
+	if err := validateFlags(); err != nil {
+		log.Println("Invalid flags", err)
+		os.Exit(1)
+	}
 
 	metrics := prometheus.NewRegistry()
 
@@ -187,10 +221,79 @@ func main() {
 		)
 	}
 	{
-		server := &http.Server{Addr: *addr}
+		var tlsConfig *tls.Config = nil
+		if flag.Lookup("self-signed") != nil || *tlsCert != "" {
+			var cert tls.Certificate
+			if *selfSigned {
+				publicKey, privateKey, err := ed25519.GenerateKey(cryptorand.Reader)
+				if err != nil {
+					log.Println("Unable to generate key", err)
+					os.Exit(1)
+				}
+
+				template := x509.Certificate{
+					SerialNumber: big.NewInt(1),
+					Subject: pkix.Name{
+						Organization: []string{*serverName},
+					},
+					NotBefore: time.Now(),
+					NotAfter:  time.Now().Add(time.Hour * 24 * 30),
+
+					KeyUsage:              x509.KeyUsageDigitalSignature,
+					ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+					BasicConstraintsValid: true,
+				}
+
+				certBytes, err := x509.CreateCertificate(cryptorand.Reader, &template, &template, publicKey, privateKey)
+				if err != nil {
+					log.Println("Unable to create self-signed certificate", err)
+					os.Exit(1)
+				}
+				certPem := pem.EncodeToMemory(&pem.Block{
+					Type:  "CERTIFICATE",
+					Bytes: certBytes,
+				})
+
+				privateKeyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
+				if err != nil {
+					log.Println("Unable to marshal private key", err)
+					os.Exit(1)
+				}
+				privateKeyPem := pem.EncodeToMemory(&pem.Block{
+					Type:  "PRIVATE KEY",
+					Bytes: privateKeyBytes,
+				})
+
+				cert, err = tls.X509KeyPair(certPem, privateKeyPem)
+				if err != nil {
+					log.Println("Unable to encode self-signed certificate", err)
+					os.Exit(1)
+				}
+			} else {
+				var err error
+				cert, err = tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+				if err != nil {
+					log.Println("Unable to load server cert and key", err)
+					os.Exit(1)
+				}
+			}
+
+			tlsConfig = &tls.Config{
+				Certificates:       []tls.Certificate{cert},
+				ServerName:         *serverName,
+				InsecureSkipVerify: *insecureSkipVerify,
+			}
+		}
+		server := &http.Server{
+			Addr:      *addr,
+			TLSConfig: tlsConfig,
+		}
 		http.Handle("/metrics", promhttp.HandlerFor(metrics, promhttp.HandlerOpts{Registry: metrics, EnableOpenMetrics: true}))
 
 		g.Add(func() error {
+			if server.TLSConfig != nil {
+				return server.ListenAndServeTLS("", "")
+			}
 			return server.ListenAndServe()
 		}, func(err error) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
